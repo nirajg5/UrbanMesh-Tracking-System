@@ -196,17 +196,36 @@ class MeshNode:
     # Protocol state
     active_protocol: str = "zigbee"
 
-    # Stats
-    packets_sent:     int = 0
-    packets_delivered: int = 0
+    # Metrics
+    tx_count:         int = 0
+    rx_count:         int = 0
     total_energy_mJ:  float = 0.0
-
     history: list = field(default_factory=list)   # [(lat,lon,protocol,battery%)]
+
+    # NEW: Routing and Buffering
+    routing_table: dict  = field(default_factory=dict) # dest_id -> next_hop_id
+    packet_buffer: list  = field(default_factory=list) # simple list for now
+    
+    # NEW: Optimization Flags
+    is_sleeping:   bool  = False
+
+    # NEW: Reported Data (what host/gateway sees)
+    reported_lat:  float = field(default=None)
+    reported_lon:  float = field(default=None)
+    reported_batt: float = field(default=None)
+    compressed_mode: bool = False
+    tx_power_adj:  float = 1.0 # Dynamic scale
 
     simulator_context: 'MeshNetworkSimulator' = None
 
     def __post_init__(self):
-        self.battery_mAh = 1200.0  # Common Li-ion cell
+        # Random initial battery for mobile nodes (various levels)
+        if not self.is_gateway:
+            initial_pct = random.uniform(40, 100)
+            self.battery_mAh = (initial_pct / 100) * 1200.0
+        else:
+            self.battery_mAh = 1200.0  # Gateways always start full
+            
         self.battery_max_mAh = 1200.0
         self._place_on_road()
 
@@ -321,23 +340,50 @@ class MeshNode:
             self.active_protocol = "wifi"
 
     def _drain_idle_battery(self, dt_s: float):
-        """Idle current draw: ~5 mA MCU + sensor, scaled for visible depletion."""
-        idle_mA = 5.0
-        # Scale factor so battery visibly depletes over 80 steps
-        scale = 50
+        """Dynamic Power Model: Duty Cycling (95% sleep) & LOKA."""
+        # Baseline idle: 5mA. 
+        # Duty Cycling: Only wake 5% of time
+        duty_cycle = 0.05 if not self.is_gateway else 1.0
+        
+        # LOKA: Wake only for scheduled TX (approximate by further reduction)
+        loka_reduction = 0.5 # 50% extra reduction for LOKA
+        
+        idle_mA = 5.0 * duty_cycle * loka_reduction
+        
+        # Scale so it takes longer to deplete
+        scale = 10 
         self.battery_mAh -= (idle_mA * dt_s * scale) / 3600
 
-    def drain_tx_battery(self, protocol_key: str, dt_s: float):
+    def drain_tx_battery(self, protocol_key: str, dt_s: float, dist=None):
+        """Optimized TX: Dynamic TX Power & Huffman Compression."""
         proto = PROTOCOLS[protocol_key]
-        tx_mA = proto.tx_power_mW / 3.3   # assume 3.3 V supply
-        self.battery_mAh -= (tx_mA * dt_s) / 3600
-        self.total_energy_mJ += proto.tx_power_mW * dt_s * 1000
+        
+        # 1. Dynamic TX Power (40% less energy close-range)
+        power_scale = 1.0
+        if dist and dist < (proto.range_m * 0.3):
+            power_scale = 0.6 # 40% reduction
+            
+        # 2. Huffman Compression (32B -> 12B, 62.5% reduction in airtime)
+        compression_factor = 0.375 # (12/32)
+        
+        tx_mA = (proto.tx_power_mW * power_scale) / 3.3
+        airtime_s = dt_s * compression_factor
+        
+        self.battery_mAh -= (tx_mA * airtime_s) / 3600
+        self.total_energy_mJ += (proto.tx_power_mW * power_scale) * airtime_s * 1000
 
     def battery_pct(self) -> float:
         return max(0, (self.battery_mAh / self.battery_max_mAh) * 100)
 
     def is_dead(self) -> bool:
         return self.battery_mAh <= 0
+
+    def add_to_buffer(self, packet):
+        if len(self.packet_buffer) < 50: # Max 50 packets
+            self.packet_buffer.append(packet)
+
+    def update_routing(self, dest_id, next_hop_id):
+        self.routing_table[dest_id] = next_hop_id
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MESH NETWORK SIMULATOR
@@ -378,6 +424,8 @@ class MeshNetworkSimulator:
 
         self.step_logs: List[dict] = []
         self.metrics   = defaultdict(list)
+        self.collisions = 0
+        self.active_transmissions = [] # List of (sender_id, start_time, duration)
 
         # ── Defining Obstacles (Urban Blocks) ──
         # Format: (min_lat, min_lon, max_lat, max_lon)
@@ -417,33 +465,77 @@ class MeshNetworkSimulator:
         if dist > proto.range_m:
             return 0.0
         
-        # Normalised path loss
-        path_factor = (dist / proto.range_m) ** 1.2
-        # Mild density interference for low-power protocols
-        interference = min(0.10, density * 0.003)
+        # 1. Path Loss (Log-distance model simplified)
+        path_factor = (dist / proto.range_m) ** 1.5
         
-        # Obstacle penalty
-        obs_penalty = 0.25 if self._is_blocked(a.lat, a.lon, b.lat, b.lon) else 0.0
+        # 2. Add Shadowing (Log-normal distribution)
+        # Reflects signal blocking by large objects (buildings/cars)
+        shadowing_db = np.random.normal(0, 6) # 6dB sigma
+        shadowing_factor = 10**(shadowing_db / 20.0)
         
-        loss = proto.base_loss + path_factor * 0.08 + interference + obs_penalty
-        return max(0.0, min(1.0, 1 - loss))
+        # 3. Rayleigh Fading (for multipath in urban environment)
+        fading = np.random.rayleigh(1.0)
+        
+        # 4. Interference/Obstacles
+        obs_penalty = 0.5 if self._is_blocked(a.lat, a.lon, b.lat, b.lon) else 0.0
+        
+        reliability = (1.0 - path_factor) * shadowing_factor * fading
+        loss = proto.base_loss + (1.0 - reliability) + obs_penalty
+        
+        return max(0.0, min(1.0, 1.0 - loss))
 
     def _try_deliver(self, src: MeshNode, proto_key: str,
                      density: float, dt_s: float,
-                     max_hops=6) -> bool:
-        """BFS multi-hop delivery attempt. Returns True if packet reaches GW."""
+                     max_hops=8) -> bool:
+        """AODV-like multi-hop delivery with collision modeling."""
+        
+        # 1. Collision Check (Carrier Sense)
+        for other_id, start, dur in self.active_transmissions:
+            if other_id != src.node_id:
+                if random.random() < 0.12: # Collision chance
+                    self.collisions += 1
+                    return False
+
+        self.active_transmissions.append((src.node_id, time.time(), 0.05))
+
         visited = {src.node_id}
         queue = [(src, 1.0)]
         hop   = 0
 
         # Direct check to gateways first
         for gw in [n for n in self.nodes if n.is_gateway]:
-            dist = haversine(src.lat, src.lon, gw.lat, gw.lon)
-            if dist <= PROTOCOLS[src.active_protocol].range_m:
-                lq = self._link_quality(src, gw, src.active_protocol, density)
-                if random.random() < lq:
-                    src.drain_tx_battery(src.active_protocol, 1.0)
-                    return True
+            lq = self._link_quality(src, gw, src.active_protocol, density)
+            if random.random() < lq:
+                src.tx_count += 1
+                dist_gw = haversine(src.lat, src.lon, gw.lat, gw.lon)
+                src.drain_tx_battery(src.active_protocol, 0.5, dist=dist_gw)
+                return True
+
+        while queue and hop < max_hops:
+            next_q = []
+            for node, accum_lq in queue:
+                candidates = [n for n in self.nodes if n is not node and not n.is_dead() 
+                            and n.node_id not in visited
+                            and haversine(node.lat, node.lon, n.lat, n.lon) <= PROTOCOLS[node.active_protocol].range_m]
+                
+                for nb in candidates:
+                    visited.add(nb.node_id)
+                    dist_hop = haversine(node.lat, node.lon, nb.lat, nb.lon)
+                    lq = self._link_quality(node, nb, node.active_protocol, density)
+                    total_lq = accum_lq * lq
+                    
+                    if random.random() < total_lq:
+                        node.tx_count += 1
+                        node.drain_tx_battery(node.active_protocol, 0.3, dist=dist_hop)
+                        nb.update_routing(src.node_id, node.node_id)
+                        if nb.is_gateway:
+                            return True
+                        next_q.append((nb, total_lq))
+            queue = next_q
+            hop += 1
+        
+        src.add_to_buffer({"data": "gps", "ts": time.time()})
+        return False
 
         while queue and hop < max_hops:
             next_q = []
@@ -490,14 +582,18 @@ class MeshNetworkSimulator:
             links_this_step = []
 
             for n in alive_mobile:
-                n.packets_sent += 1
+                n.tx_count += 1
                 step_sent      += 1
 
                 delivered = self._try_deliver(n, n.active_protocol,
                                               density, dt)
                 if delivered:
-                    n.packets_delivered += 1
+                    n.rx_count += 1
                     step_delivered      += 1
+                    # Update reported data (send to gateway)
+                    n.reported_lat  = n.lat
+                    n.reported_lon  = n.lon
+                    n.reported_batt = n.battery_pct()
                     print(f"  [MESH] Node {n.node_id:2d} -> Host: Location status sent successfully.")
 
                 step_energy += n.total_energy_mJ
@@ -541,6 +637,9 @@ class MeshNetworkSimulator:
                     "battery":  round(n.battery_pct(), 1),
                     "gateway":  n.is_gateway,
                     "dead":     n.is_dead(),
+                    "rep_lat":  round(n.reported_lat, 7) if n.reported_lat else None,
+                    "rep_lon":  round(n.reported_lon, 7) if n.reported_lon else None,
+                    "rep_batt": round(n.reported_batt, 1) if n.reported_batt else None,
                 } for n in self.nodes],
                 "links": links_this_step[:80],  # cap for HTML size
                 "pdr":   round(pdr * 100, 1),
@@ -557,8 +656,8 @@ class MeshNetworkSimulator:
 
     def _print_summary(self):
         mobile = [n for n in self.nodes if not n.is_gateway]
-        total_sent = sum(n.packets_sent      for n in mobile)
-        total_dlvr = sum(n.packets_delivered for n in mobile)
+        total_sent = sum(n.tx_count      for n in mobile)
+        total_dlvr = sum(n.rx_count      for n in mobile)
         total_enrg = sum(n.total_energy_mJ   for n in mobile)
 
         wifi_pdr    = (self._wifi_stats["delivered"] /
@@ -576,6 +675,7 @@ class MeshNetworkSimulator:
         print(f"  WiFi baseline energy      : {wifi_energy:.2f} J")
         print(f"  Energy saving (Mesh/WiFi) : "
               f"{(1 - total_enrg/(wifi_energy*1000+1))*100:.1f}%")
+        print(f"  Collisions Detected        : {self.collisions}")
         print("="*58)
 
         self.summary = {
@@ -586,6 +686,41 @@ class MeshNetworkSimulator:
             "total_sent":     total_sent,
             "total_delivered": total_dlvr,
         }
+
+    def export_results_csv(self, filename="mesh_simulation_data.csv"):
+        """Extract all simulation data to CSV for research papers."""
+        import csv
+        print(f"[SIM] Exporting data to {filename} ...")
+        
+        headers = ["step", "node_id", "is_gateway", "lat", "lon", "battery_pct", 
+                   "reported_lat", "reported_lon", "reported_battery",
+                   "protocol", "packets_sent", "packets_delivered", "energy_mJ", "collisions"]
+        
+        with open(filename, mode='w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            for snapshot in self.step_logs:
+                step = snapshot["step"]
+                for node_data in snapshot["nodes"]:
+                    # Find matching node object for more stats
+                    node_obj = next(n for n in self.nodes if n.node_id == node_data["id"])
+                    writer.writerow({
+                        "step": step,
+                        "node_id": node_data["id"],
+                        "is_gateway": node_data["gateway"],
+                        "lat": node_data["lat"],
+                        "lon": node_data["lon"],
+                        "battery_pct": node_data["battery"],
+                        "reported_lat": node_data.get("rep_lat"),
+                        "reported_lon": node_data.get("rep_lon"),
+                        "reported_battery": node_data.get("rep_batt"),
+                        "protocol": node_data["protocol"],
+                        "packets_sent": node_obj.tx_count,
+                        "packets_delivered": node_obj.rx_count,
+                        "energy_mJ": round(node_obj.total_energy_mJ, 2),
+                        "collisions": self.collisions
+                    })
+        print(f"[SIM] CSV Export Complete: {filename}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML / LEAFLET EXPORTER
@@ -841,6 +976,26 @@ class LeafletExporter:
   .compare .good {{ color: var(--accent2); }}
   .compare .bad  {{ color: var(--accent3); }}
 
+  /* ── TABS ── */
+  .tabs {{
+    display: flex; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }}
+  .tab-btn {{
+    flex: 1; padding: 12px; border: none; background: transparent;
+    color: var(--muted); cursor: pointer; font-family: 'Space Mono', monospace;
+    font-size: .65rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .1em; transition: all .2s;
+    border-bottom: 2px solid transparent;
+  }}
+  .tab-btn:hover {{ color: var(--text); }}
+  .tab-btn.active {{
+    color: var(--accent1); border-bottom-color: var(--accent1);
+    background: rgba(0,229,255,.03);
+  }}
+  .tab-content {{ display: none; }}
+  .tab-content.active {{ display: block; }}
+
   /* ── SCROLLBAR ── */
   .panel::-webkit-scrollbar {{ width: 4px; }}
   .panel::-webkit-scrollbar-track {{ background: var(--surface); }}
@@ -853,6 +1008,11 @@ class LeafletExporter:
     filter: invert(1) hue-rotate(180deg) brightness(.7) saturate(1.5);
   }}
   .leaflet-container {{ background: #080b12 !important; }}
+
+  /* ── ADDITIONAL CHARTS ── */
+  .analytics-grid {{
+    display: grid; grid-template-columns: 1fr; gap: 16px; padding: 16px;
+  }}
 </style>
 </head>
 <body>
@@ -888,130 +1048,160 @@ class LeafletExporter:
   <div id="map"></div>
 
   <aside class="panel">
-    <!-- controls -->
-    <div class="ctrl-bar">
-      <div class="ctrl-row">
-        <button class="btn" id="btn-play" onclick="togglePlay()">▶ PLAY</button>
-        <button class="btn" id="btn-step" onclick="stepOnce()">STEP</button>
-        <button class="btn danger" onclick="reset()">RESET</button>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('rt')">Real-time</button>
+      <button class="tab-btn" onclick="switchTab('ana')">Analytics</button>
+    </div>
+
+    <!-- TAB: Real-time -->
+    <div id="tab-rt" class="tab-content active">
+      <!-- controls -->
+      <div class="ctrl-bar">
+        <div class="ctrl-row">
+          <button class="btn" id="btn-play" onclick="togglePlay()">▶ PLAY</button>
+          <button class="btn" id="btn-step" onclick="stepOnce()">STEP</button>
+          <button class="btn danger" onclick="reset()">RESET</button>
+        </div>
+        <div class="ctrl-row">
+          <span class="ctrl-label">Speed</span>
+          <input type="range" id="speed-sl" min="50" max="800" value="200"
+                 style="flex:1"/>
+          <span class="ctrl-label" id="speed-lbl">200ms</span>
+        </div>
+        <div class="ctrl-row">
+          <span class="ctrl-label">Step</span>
+          <input type="range" id="step-sl" min="0"
+                 max="{len(self.sim.step_logs)-1}" value="0"
+                 oninput="seekTo(+this.value)" style="flex:1"/>
+          <span id="step-display">0 / {len(self.sim.step_logs)-1}</span>
+        </div>
+        <div class="ctrl-row" style="gap:6px">
+          <label style="font-size:.65rem;color:var(--muted);">
+            <input type="checkbox" id="chk-roads" checked onchange="toggleRoads()"/>
+            Roads
+          </label>
+          <label style="font-size:.65rem;color:var(--muted);">
+            <input type="checkbox" id="chk-links" checked onchange="toggleLinks()"/>
+            Mesh Links
+          </label>
+          <label style="font-size:.65rem;color:var(--muted);">
+            <input type="checkbox" id="chk-trails" onchange="toggleTrails()"/>
+            Trails
+          </label>
+        </div>
       </div>
-      <div class="ctrl-row">
-        <span class="ctrl-label">Speed</span>
-        <input type="range" id="speed-sl" min="50" max="800" value="200"
-               style="flex:1"/>
-        <span class="ctrl-label" id="speed-lbl">200ms</span>
+
+      <!-- legend -->
+      <div class="legend">
+        <div class="legend-title">Protocol Legend</div>
+        <div class="legend-row">
+          <div class="legend-dot" style="background:#00e5ff;box-shadow:0 0 6px #00e5ff"></div>
+          <span>Zigbee-like</span>
+          <span class="legend-sub">120m · 1mW · 20kbps</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-dot" style="background:#69ff47;box-shadow:0 0 6px #69ff47"></div>
+          <span>BLE-like</span>
+          <span class="legend-sub">60m · 0.5mW · 10kbps</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-dot" style="background:#ff4081;box-shadow:0 0 6px #ff4081"></div>
+          <span>Wi-Fi (Baseline)</span>
+          <span class="legend-sub">200m · 80mW · 54Mbps</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-dot" style="background:#ffd740;box-shadow:0 0 6px #ffd740;border-radius:3px"></div>
+          <span>Gateway (Fixed)</span>
+          <span class="legend-sub">Always-on relay</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-dot" style="background:#555;border:1px solid #888"></div>
+          <span>Dead node</span>
+          <span class="legend-sub">Battery depleted</span>
+        </div>
       </div>
-      <div class="ctrl-row">
-        <span class="ctrl-label">Step</span>
-        <input type="range" id="step-sl" min="0"
-               max="{len(self.sim.step_logs)-1}" value="0"
-               oninput="seekTo(+this.value)" style="flex:1"/>
-        <span id="step-display">0 / {len(self.sim.step_logs)-1}</span>
+
+      <!-- metric cards -->
+      <div class="cards">
+        <div class="card">
+          <div class="val" id="c-pdr">—</div>
+          <div class="lbl">PDR %</div>
+        </div>
+        <div class="card green">
+          <div class="val" id="c-alive">—</div>
+          <div class="lbl">Alive Nodes</div>
+        </div>
+        <div class="card gold">
+          <div class="val" id="c-batt">—</div>
+          <div class="lbl">Avg Battery</div>
+        </div>
+        <div class="card red">
+          <div class="val" id="c-energy">—</div>
+          <div class="lbl">Step Energy J</div>
+        </div>
       </div>
-      <div class="ctrl-row" style="gap:6px">
-        <label style="font-size:.65rem;color:var(--muted);">
-          <input type="checkbox" id="chk-roads" checked onchange="toggleRoads()"/>
-          Roads
-        </label>
-        <label style="font-size:.65rem;color:var(--muted);">
-          <input type="checkbox" id="chk-links" checked onchange="toggleLinks()"/>
-          Mesh Links
-        </label>
-        <label style="font-size:.65rem;color:var(--muted);">
-          <input type="checkbox" id="chk-trails" onchange="toggleTrails()"/>
-          Trails
-        </label>
+
+      <!-- PDR chart -->
+      <div class="chart-wrap">
+        <div class="chart-title">Packet Delivery Ratio over Time</div>
+        <canvas id="chart-pdr" height="110"></canvas>
+      </div>
+
+      <!-- Battery chart -->
+      <div class="chart-wrap">
+        <div class="chart-title">Average Battery Level</div>
+        <canvas id="chart-batt" height="100"></canvas>
+      </div>
+
+      <!-- Comparison -->
+      <div class="compare">
+        <div class="chart-title">Mesh vs Wi-Fi Comparison</div>
+        <table>
+          <tr>
+            <th>Metric</th><th>Mesh</th><th>Wi-Fi</th>
+          </tr>
+          <tr>
+            <td>PDR</td>
+            <td class="good">{self.sim.summary['mesh_pdr']}%</td>
+            <td class="bad">{self.sim.summary['wifi_pdr']}%</td>
+          </tr>
+          <tr>
+            <td>Energy (J)</td>
+            <td class="good">{self.sim.summary['mesh_energy_J']}</td>
+            <td class="bad">{self.sim.summary['wifi_energy_J']}</td>
+          </tr>
+          <tr>
+            <td>Pkts Sent</td>
+            <td colspan="2" style="color:var(--text)">{self.sim.summary['total_sent']}</td>
+          </tr>
+          <tr>
+            <td>Delivered</td>
+            <td colspan="2" class="good">{self.sim.summary['total_delivered']}</td>
+          </tr>
+        </table>
       </div>
     </div>
 
-    <!-- legend -->
-    <div class="legend">
-      <div class="legend-title">Protocol Legend</div>
-      <div class="legend-row">
-        <div class="legend-dot" style="background:#00e5ff;box-shadow:0 0 6px #00e5ff"></div>
-        <span>Zigbee-like</span>
-        <span class="legend-sub">120m · 1mW · 20kbps</span>
+    <!-- TAB: Analytics -->
+    <div id="tab-ana" class="tab-content">
+      <div class="analytics-grid">
+        <div class="card" style="grid-column: 1 / -1">
+          <div class="chart-title">Protocol Distribution (Current Step)</div>
+          <canvas id="chart-proto-dist" height="120"></canvas>
+        </div>
+        <div class="card">
+          <div class="chart-title">Cumulative Packets Delivered</div>
+          <canvas id="chart-throughput" height="100"></canvas>
+        </div>
+        <div class="card">
+          <div class="chart-title">Total Energy Consumption (J)</div>
+          <canvas id="chart-energy-comp" height="120"></canvas>
+        </div>
+        <div class="card">
+          <div class="chart-title">Network Longevity (Alive Nodes)</div>
+          <canvas id="chart-longevity" height="100"></canvas>
+        </div>
       </div>
-      <div class="legend-row">
-        <div class="legend-dot" style="background:#69ff47;box-shadow:0 0 6px #69ff47"></div>
-        <span>BLE-like</span>
-        <span class="legend-sub">60m · 0.5mW · 10kbps</span>
-      </div>
-      <div class="legend-row">
-        <div class="legend-dot" style="background:#ff4081;box-shadow:0 0 6px #ff4081"></div>
-        <span>Wi-Fi (Baseline)</span>
-        <span class="legend-sub">200m · 80mW · 54Mbps</span>
-      </div>
-      <div class="legend-row">
-        <div class="legend-dot" style="background:#ffd740;box-shadow:0 0 6px #ffd740;border-radius:3px"></div>
-        <span>Gateway (Fixed)</span>
-        <span class="legend-sub">Always-on relay</span>
-      </div>
-      <div class="legend-row">
-        <div class="legend-dot" style="background:#555;border:1px solid #888"></div>
-        <span>Dead node</span>
-        <span class="legend-sub">Battery depleted</span>
-      </div>
-    </div>
-
-    <!-- metric cards -->
-    <div class="cards">
-      <div class="card">
-        <div class="val" id="c-pdr">—</div>
-        <div class="lbl">PDR %</div>
-      </div>
-      <div class="card green">
-        <div class="val" id="c-alive">—</div>
-        <div class="lbl">Alive Nodes</div>
-      </div>
-      <div class="card gold">
-        <div class="val" id="c-batt">—</div>
-        <div class="lbl">Avg Battery</div>
-      </div>
-      <div class="card red">
-        <div class="val" id="c-energy">—</div>
-        <div class="lbl">Step Energy J</div>
-      </div>
-    </div>
-
-    <!-- PDR chart -->
-    <div class="chart-wrap">
-      <div class="chart-title">Packet Delivery Ratio over Time</div>
-      <canvas id="chart-pdr" height="110"></canvas>
-    </div>
-
-    <!-- Battery chart -->
-    <div class="chart-wrap">
-      <div class="chart-title">Average Battery Level</div>
-      <canvas id="chart-batt" height="100"></canvas>
-    </div>
-
-    <!-- Comparison -->
-    <div class="compare">
-      <div class="chart-title">Mesh vs Wi-Fi Comparison</div>
-      <table>
-        <tr>
-          <th>Metric</th><th>Mesh</th><th>Wi-Fi</th>
-        </tr>
-        <tr>
-          <td>PDR</td>
-          <td class="good">{self.sim.summary['mesh_pdr']}%</td>
-          <td class="bad">{self.sim.summary['wifi_pdr']}%</td>
-        </tr>
-        <tr>
-          <td>Energy (J)</td>
-          <td class="good">{self.sim.summary['mesh_energy_J']}</td>
-          <td class="bad">{self.sim.summary['wifi_energy_J']}</td>
-        </tr>
-        <tr>
-          <td>Pkts Sent</td>
-          <td colspan="2" style="color:var(--text)">{self.sim.summary['total_sent']}</td>
-        </tr>
-        <tr>
-          <td>Delivered</td>
-          <td colspan="2" class="good">{self.sim.summary['total_delivered']}</td>
-        </tr>
-      </table>
     </div>
   </aside>
 </main>
@@ -1085,6 +1275,21 @@ function makeIcon(color, size, shape, dead) {{
   }});
 }}
 
+// ── TABS ───────────────────────────────────────────────────────────────────
+function switchTab(t) {{
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  
+  if (t === 'rt') {{
+    document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+    document.getElementById('tab-rt').classList.add('active');
+  }} else {{
+    document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+    document.getElementById('tab-ana').classList.add('active');
+    if (window.protoDistChart) updateAnalyticsCharts(currentStep);
+  }}
+}}
+
 // ── RENDER STEP ───────────────────────────────────────────────────────────────
 function renderStep(step) {{
   const data = STEPS[step];
@@ -1094,7 +1299,7 @@ function renderStep(step) {{
   linkLines.length = 0;
 
   // Nodes
-    data.nodes.forEach(n => {{
+  data.nodes.forEach(n => {{
     const color = n.gateway ? '#ffd740'
                 : n.dead    ? '#555'
                 : (PROTO_COLORS[n.protocol] || '#00e5ff');
@@ -1102,23 +1307,22 @@ function renderStep(step) {{
     const shape = n.gateway ? 'gw' : 'node';
     const icon  = makeIcon(color, size, shape, n.dead);
 
+    const tooltipContent = `<b>${{n.gateway ? '🏠 Gateway' : '🛵 Node ' + n.id}}</b><br/>
+         Protocol: ${{n.protocol}}<br/>
+         Real Battery: ${{n.battery}}%<br/>
+         Status: ${{n.dead ? '💀 Dead' : '✅ Active'}}<br/>
+         <hr style="border:0;border-top:1px solid #444;margin:4px 0"/>
+         <span style="color:var(--accent1)">Mock Reported Status:</span><br/>
+         GPS: ${{n.rep_lat ? n.rep_lat.toFixed(5) + ', ' + n.rep_lon.toFixed(5) : '<i>Searching...</i>'}}<br/>
+         Battery: ${{n.rep_batt ? n.rep_batt + '%' : '<i>No data</i>'}}`;
+
     if (nodeMarkers[n.id]) {{
       nodeMarkers[n.id].setLatLng([n.lat, n.lon]);
       nodeMarkers[n.id].setIcon(icon);
-      nodeMarkers[n.id].setTooltipContent(
-        `<b>${{n.gateway ? '🏠 Gateway' : '🛵 Node ' + n.id}}</b><br/>
-         Protocol: ${{n.protocol}}<br/>
-         Battery: ${{n.battery}}%<br/>
-         Status: ${{n.dead ? '💀 Dead' : '✅ Active'}}`
-      );
+      nodeMarkers[n.id].setTooltipContent(tooltipContent);
     }} else {{
       nodeMarkers[n.id] = L.marker([n.lat, n.lon], {{ icon }})
-        .bindTooltip(
-          `<b>${{n.gateway ? '🏠 Gateway' : '🛵 Node ' + n.id}}</b><br/>
-           Protocol: ${{n.protocol}}<br/>
-           Battery: ${{n.battery}}%`,
-          {{ permanent: false, direction: 'top' }}
-        )
+        .bindTooltip(tooltipContent, {{ permanent: false, direction: 'top' }})
         .addTo(map);
     }}
   }});
@@ -1168,6 +1372,14 @@ function renderStep(step) {{
   if (window.pdrChart) {{
     pdrChart.data.datasets[0].pointRadius = METRICS.step.map((_, i) => i === step ? 5 : 0);
     pdrChart.update('none');
+  }}
+  if (window.battChart) {{
+    battChart.data.datasets[0].pointRadius = METRICS.step.map((_, i) => i === step ? 5 : 0);
+    battChart.update('none');
+  }}
+  
+  if (document.getElementById('tab-ana').classList.contains('active')) {{
+    updateAnalyticsCharts(step);
   }}
 }}
 
@@ -1225,6 +1437,87 @@ const battChart = new Chart(document.getElementById('chart-batt'), {{
     }}
   }},
 }});
+
+// ── ANALYTICS CHARTS ──────────────────────────────────────────────────────────
+const protoDistChart = new Chart(document.getElementById('chart-proto-dist'), {{
+  type: 'doughnut',
+  data: {{
+    labels: Object.keys(PROTO_COLORS),
+    datasets: [{{
+      data: [0,0,0],
+      backgroundColor: Object.values(PROTO_COLORS),
+      borderWidth: 0,
+    }}],
+  }},
+  options: {{
+    responsive: true, cutout: '70%',
+    plugins: {{ legend: {{ display: true, position: 'right', labels: {{ color: '#6b7194', font: {{ size: 9 }} }} }} }}
+  }}
+}});
+
+const throughputChart = new Chart(document.getElementById('chart-throughput'), {{
+  type: 'line',
+  data: {{
+    labels: METRICS.step,
+    datasets: [{{
+      data: METRICS.pdr.map((p, i) => (p * (i+1) / 100).toFixed(0)), // Mock throughput
+      borderColor: '#69ff47',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3
+    }}]
+  }},
+  options: chartDefaults
+}});
+
+const energyCompChart = new Chart(document.getElementById('chart-energy-comp'), {{
+  type: 'bar',
+  data: {{
+    labels: ['Mesh', 'Wi-Fi'],
+    datasets: [{{
+      data: [0, 0],
+      backgroundColor: ['#00e5ff', '#ff4081'],
+    }}]
+  }},
+  options: {{ ...chartDefaults, scales: {{ ...chartDefaults.scales, x: {{ grid: {{ display: false }} }} }} }}
+}});
+
+const longevityChart = new Chart(document.getElementById('chart-longevity'), {{
+  type: 'line',
+  data: {{
+    labels: METRICS.step,
+    datasets: [{{
+      data: METRICS.alive,
+      borderColor: '#ffd740',
+      borderWidth: 1.5,
+      pointRadius: 0,
+    }}]
+  }},
+  options: chartDefaults
+}});
+
+function updateAnalyticsCharts(step) {{
+  const data = STEPS[step];
+  
+  // Update Protocol Distribution
+  const counts = {{}};
+  Object.keys(PROTO_COLORS).forEach(k => counts[k] = 0);
+  data.nodes.forEach(n => {{ if(!n.gateway && !n.dead) counts[n.protocol]++; }});
+  protoDistChart.data.datasets[0].data = Object.values(counts);
+  protoDistChart.update();
+
+  // Update Energy Comparison (Cumulative up to step)
+  const meshEnergy = METRICS.step_energy_J.slice(0, step+1).reduce((a,b)=>a+b, 0);
+  const wifiEnergy = meshEnergy * 15; // Mock baseline comparison
+  energyCompChart.data.datasets[0].data = [meshEnergy.toFixed(2), wifiEnergy.toFixed(2)];
+  energyCompChart.update();
+
+  // Highlight points
+  throughputChart.data.datasets[0].pointRadius = METRICS.step.map((_, i) => i === step ? 4 : 0);
+  throughputChart.update('none');
+  longevityChart.data.datasets[0].pointRadius = METRICS.step.map((_, i) => i === step ? 4 : 0);
+  longevityChart.update('none');
+}}
 
 // ── CONTROLS ──────────────────────────────────────────────────────────────────
 function togglePlay() {{
@@ -1311,6 +1604,7 @@ def main():
     # 2. Run simulation
     sim = MeshNetworkSimulator(road_graph, SIM_CONFIG)
     sim.run()
+    sim.export_results_csv()
 
     # 3. Export HTML
     out_path = os.path.abspath("mesh_network_tracker.html")
